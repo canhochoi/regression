@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regression"
+version = "0.1.0"
+description = "GPU-capable Regression with compositional tools"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Le Quang Luan"}]
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.22",
+  "torch>=2.0",
+  "scikit-learn>=1.1",
+  "scikit-bio>=0.5,<0.7"
+]
+
+[project.optional-dependencies]
+dev = [
+  "ipykernel",
+  "jupyterlab",
+  "jupyter_client",
+  "pyzmq",
+  "tornado",
+  "traitlets",
+  "pytest"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
