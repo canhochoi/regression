@@ -1,6 +1,7 @@
 # src/myrrr/preprocessing.py
 import numpy as np
 
+# controls star imports of the module (i.e., from regression.preprocessing import *)
 __all__ = ["CompositionalILR", "StandardScalerX", "CenterY", "TrainTestSplit"]
 
 try:
