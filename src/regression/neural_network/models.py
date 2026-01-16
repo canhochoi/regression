@@ -495,11 +495,13 @@ class CompositionModel(nn.Module):
                  aggregator: Aggregator | None = None,
                  postprocessor: Postprocessor | None = None,
                  device: Optional[torch.device] = 'cuda',
+                 log_norm: bool = True,
                  **predictor_kwargs):
         super().__init__()
         self.method = method
         self.device = device
-        self.preprocessor = (preprocessor or Preprocessor()).to(device=self.device)
+        self.log_norm = log_norm
+        self.preprocessor = (preprocessor or Preprocessor(log_norm=self.log_norm)).to(device=self.device)
         self.aggregator = (aggregator or Aggregator(mode=aggregator_mode)).to(device=self.device)   
         self.postprocessor = (postprocessor or Postprocessor(mode="identity")).to(device=self.device)
         out_act = nn.Softmax(dim=1) if self.method in ("softmax_celltype", "softmax_ilr") else None

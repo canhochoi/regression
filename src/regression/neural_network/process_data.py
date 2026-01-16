@@ -229,6 +229,7 @@ class Preprocessor(nn.Module):
                  cont_cov_mask: Optional[torch.Tensor] = None,
                  cov_mean: Optional[torch.Tensor] = None,
                  cov_std: Optional[torch.Tensor] = None,
+                 log_norm: bool = True,
                  scaling_factor: float = 1e4,
                  normalize: bool = True):
         '''
@@ -247,6 +248,7 @@ class Preprocessor(nn.Module):
         self.cont_cov_mask = cont_cov_mask
         self.scaling_factor = scaling_factor
         self.normalize = normalize
+        self.log_norm = log_norm
         
         if gene_mean is not None: 
             self.register_buffer("gene_mean", gene_mean[gene_mask].to(device=device))
@@ -268,8 +270,12 @@ class Preprocessor(nn.Module):
 
     def forward(self, X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
         if self.normalize:
-            denom = X.sum(dim=1, keepdim=True)
-            X = torch.log1p(X / denom * self.scaling_factor)
+            
+            if self.log_norm:
+                denom = X.sum(dim=1, keepdim=True)
+                X = torch.log1p(X / denom * self.scaling_factor)
+            else:
+                pass 
 
             if self.gene_mask is not None:
                 X = X[:, self.gene_mask]
