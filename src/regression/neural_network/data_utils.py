@@ -314,7 +314,7 @@ def build_loaders(
         ),
     }
 
-def compute_cellwise_stats(train_loader, scaling_factor = 1e4, device="cpu"):
+def compute_cellwise_stats(train_loader, log_norm: bool = True, scaling_factor = 1e4, device="cpu"):
     gene_sum = gene_sumsq = cov_sum = cov_sumsq = None
     n_cells_total = 0
     for X_batch, cell_to_batch, Z_batch, Y_batch, _ in train_loader:
@@ -323,7 +323,11 @@ def compute_cellwise_stats(train_loader, scaling_factor = 1e4, device="cpu"):
          # add this to map Z to each cell 
         Zb = Zb[cell_to_batch.to(device = device)]
 
-        Xb = torch.log1p(Xb / Xb.sum(dim=1, keepdim=True) * scaling_factor)
+        if log_norm:
+            Xb = torch.log1p(Xb / Xb.sum(dim=1, keepdim=True) * scaling_factor)
+        else:
+            pass # no normalization
+        
         if gene_sum is None:
             G = Xb.shape[1]
             # C = Zb.shape[1]
