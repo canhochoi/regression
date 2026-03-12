@@ -7,6 +7,7 @@ from skbio.stats.composition import ilr_inv, clr, ilr
 from regression.neural_network.data_utils import PseudobulkAggregator, RowLibSizeNorm
 
 
+
 # controls star imports of the module (i.e., from regression.neural_network.models import *)
 __all__ = ["Regressor", "PseudobulkLinearProportions", "MLP_PseudobulkLinearProportions",
            "MLP", "CellPredictor", "CompositionModel"]
@@ -481,10 +482,92 @@ class CellPredictor(nn.Module):
     def forward(self, X):
         return self.network(X)
     
+from typing import List, Optional, Sequence, Union, Callable
+import torch
+import torch.nn as nn
+
+ActivationFactory = Callable[[], nn.Module]
+
+class CLRProjection(nn.Module):
+    """
+    Enforces sum_j y_ij = 0 for each row i by subtracting the row mean.
+    """
+    def __init__(self, dim: int = -1):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, Y: torch.Tensor) -> torch.Tensor:
+        return Y - Y.mean(dim=self.dim, keepdim=True)
+
+
+class CellPredictorCLR(nn.Module):
+    def __init__(self, in_features: int,
+                 hidden_features: Union[int, Sequence[int]],
+                 out_features: int,                       # should be D (e.g., 17 for CLR)
+                 num_hidden_layers: int = 1,
+                 activation: bool = False,
+                 activation_type: Union[ActivationFactory, Sequence[Optional[ActivationFactory]]] = nn.ReLU,
+                 out_activation: Optional[nn.Module] = None,
+                 dropout: Optional[Union[float, Sequence[float]]] = None,
+                 batch_norm: bool = False,
+                 layer_norm: bool = False,
+                 bias: bool = True,
+                 enforce_clr_sum0: bool = True,            # <-- new
+                 device: Optional[torch.device] = "cuda",
+                 dtype: Optional[torch.dtype] = torch.float32):
+        super().__init__()
+
+        hs = [hidden_features] * num_hidden_layers if isinstance(hidden_features, int) else list(hidden_features)
+
+        if activation:
+            if callable(activation_type):
+                act_fns: List[Optional[ActivationFactory]] = [activation_type] * len(hs)
+            else:
+                act_fns = list(activation_type)
+                if len(act_fns) != len(hs):
+                    raise ValueError("activation_type list length must match number of hidden layers")
+        else:
+            act_fns = [None] * len(hs)
+
+        drops = ([0.0] * len(hs) if dropout is None
+                 else ([float(dropout)] * len(hs) if isinstance(dropout, (int, float))
+                 else list(dropout)))
+        if len(drops) != len(hs):
+            raise ValueError("dropout list length must match number of hidden layers")
+
+        layers: List[nn.Module] = []
+        prev = in_features
+        for i, h in enumerate(hs):
+            layers.append(nn.Linear(prev, h, bias=bias, dtype=dtype))
+            if batch_norm:
+                layers.append(nn.BatchNorm1d(h, dtype=dtype))
+            if layer_norm:
+                layers.append(nn.LayerNorm(h, dtype=dtype))
+            if act_fns[i] is not None:
+                layers.append(act_fns[i]())
+            if drops[i] and drops[i] > 0.0:
+                layers.append(nn.Dropout(drops[i]))
+            prev = h
+
+        layers.append(nn.Linear(prev, out_features, bias=bias, dtype=dtype))
+
+        if out_activation is not None:
+            layers.append(out_activation)
+
+        # # Enforce CLR constraint at the very end
+        if enforce_clr_sum0:
+            layers.append(CLRProjection(dim=1))
+
+        self.network = nn.Sequential(*layers).to(device=device, dtype=dtype)
+
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        return self.network(X)
+
 
 from regression.neural_network.process_data import Preprocessor
 from regression.neural_network.process_data import Aggregator
 from regression.neural_network.process_data import Postprocessor
+from regression.neural_network.autoencoder import MLPEncoderDecoder
 
 class CompositionModel(nn.Module):
     def __init__(self, in_features: int, out_features: int,
@@ -524,7 +607,10 @@ class CompositionModel(nn.Module):
         cell_to_batch = sample_idx_batch[cell_to_batch]
 
         Xp = self.preprocessor(X, Z)
-        X_cell = self.cell_predictor(Xp)
+        if isinstance(self.cell_predictor, MLPEncoderDecoder):
+            X_cell, self.Z_cell = self.cell_predictor(Xp)
+        else:
+            X_cell = self.cell_predictor(Xp)
         Y_sample = self.aggregator(X_cell, cell_to_batch, sample_idx_batch)
         return self.postprocessor(Y_sample)
     

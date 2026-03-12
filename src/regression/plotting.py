@@ -683,3 +683,224 @@ class Plotting(PlottingSamplingMixin):
 
         fig.tight_layout()
         return fig, axes
+
+# for plotting clustering heatmap
+import seaborn as sns
+import pandas as pd
+import matplotlib as mpl
+
+def continuous_df_to_colors(df: pd.DataFrame, scale_method: list["min_max", "z_score"] = "z_score", cmap_name="viridis"):
+
+    cmap = mpl.colormaps[cmap_name]
+    out = pd.DataFrame(index=df.index)
+    norm = mpl.colors.Normalize(vmin=0, vmax=1)
+    scales = {}
+    
+    for col in df.columns:
+        v = df[col].astype(float)
+       
+        # out[col] = [mpl.colors.to_hex(cmap(x)) for x in v]
+        match scale_method:
+            case "min_max":
+                vmin = float(v.min())
+                vmax = float(v.max())
+                scales[col] = (vmin, vmax)
+                v = (v - vmin) / (vmax- vmin + 1e-12)  # scale 0..1 per cell type
+    
+            case "z_score":
+                vmean = float(v.mean())
+                vstd = float(v.std())
+                v = (v - vmean) / vstd
+                vmin = float(v.min())
+                vmax = float(v.max())
+                scales[col] = (vmin, vmax)
+            
+            case "clipping":
+                v = np.clip(v, -10, 10)
+                vmin = float(v.min())
+                vmax = float(v.max())
+                scales[col] = (vmin, vmax)
+        
+        out[col] = [mpl.colors.to_hex(cmap(x)) for x in v]
+
+        # out[col] = [mpl.colors.to_hex(cmap(norm(x))) for x in v]
+    return out, scales
+
+def categorical_df_to_colors(df: pd.DataFrame, palette="tab20", na_color="#cccccc"):
+    """
+    Map each categorical column to hex colors using a discrete palette.
+    Returns:
+      colors_df: same shape as df, hex colors
+      mappings: dict col -> dict(category -> hex)
+    """
+    colors = pd.DataFrame(index=df.index)
+    mappings = {}
+
+    for col in df.columns:
+        s = df[col].astype("category")
+        cats = list(s.cat.categories)
+
+        pal = sns.color_palette(palette, n_colors=max(len(cats), 1))
+        mapping = {cat: mpl.colors.to_hex(pal[i]) for i, cat in enumerate(cats)}
+        mappings[col] = mapping
+
+        mapped = s.map(mapping).astype(object)   # <-- key change
+        colors[col] = mapped.fillna(na_color)
+
+    return colors, mappings
+
+def mixed_df_to_colors(
+    df: pd.DataFrame,
+    categorical_cols=None,
+    continuous_cols=None,
+    *,
+    cont_scale_method="z_score",
+    cont_cmap="viridis",
+    cat_palette="tab20",
+    na_color="#cccccc",
+):
+    """
+    Convert a mixed df into a color df for seaborn clustermap col_colors.
+
+    If categorical_cols/continuous_cols are None, it infers:
+      - categorical: dtype 'object' or 'category'
+      - continuous: numeric dtypes
+    """
+    if categorical_cols is None and continuous_cols is None:
+        categorical_cols = df.select_dtypes(include=["object", "category"]).columns.tolist()
+        continuous_cols = df.columns.difference(categorical_cols).tolist()
+
+    out_parts = []
+    meta = {}
+
+    if continuous_cols:
+        cont_colors, cont_scales = continuous_df_to_colors(
+            df[continuous_cols],
+            scale_method=cont_scale_method,
+            cmap_name=cont_cmap
+        )
+        out_parts.append(cont_colors)
+        meta["continuous_scales"] = cont_scales
+
+    if categorical_cols:
+        cat_colors, cat_maps = categorical_df_to_colors(
+            df[categorical_cols],
+            palette=cat_palette,
+            na_color=na_color
+        )
+        out_parts.append(cat_colors)
+        meta["categorical_maps"] = cat_maps
+
+    colors_df = pd.concat(out_parts, axis=1) if out_parts else pd.DataFrame(index=df.index)
+    return colors_df, meta
+
+def get_zmin_zmax(scales):
+    scale_array = []
+    for ct, scale in scales.items():
+        scale_array.append(np.array(scale))
+    
+    scale_array = np.array(scale_array)
+    return scale_array.min(), scale_array.max()
+
+import matplotlib.pyplot as plt
+from matplotlib.patches import Patch
+
+def add_categorical_legends(fig, categorical_maps, *, anchor=(1.02, 0.98), fontsize=10):
+    """
+    categorical_maps: dict[col -> dict[category -> hex]]
+    Adds stacked legends to the right of the figure.
+    """
+    x0, y0 = anchor
+    dy = 0.12  # vertical spacing between legends (tune)
+
+    for i, (col, mapping) in enumerate(categorical_maps.items()):
+        handles = [Patch(facecolor=color, edgecolor="none", label=str(cat))
+                   for cat, color in mapping.items()]
+
+        leg = fig.legend(
+            handles=handles,
+            title=col,
+            loc="upper left",
+            bbox_to_anchor=(x0, y0 - i * dy),
+            frameon=False,
+            fontsize=fontsize,
+            title_fontsize=fontsize
+        )
+        fig.add_artist(leg)
+
+def plot_clustering(X_df, 
+                    title: str,
+                    vmin: float, 
+                    vmax: float, 
+                    scales = None, 
+                    col_colors = None, 
+                    categorical_maps = None,
+                    z_score: int = 0, 
+                    col_linkage = None, row_linkage = None, 
+                    scale_method = "z_score",
+                    cmap_name = "Spectral_r"  #add _r for reverse
+                    ):
+    '''
+    X_df: dataframe of samples by features (e.g., genes, cell type proportions)
+    '''
+    
+    g = sns.clustermap(
+    X_df.T,
+    z_score=z_score,
+    cmap ="vlag",
+    vmin = vmin,
+    vmax = vmax,
+    col_colors = col_colors, 
+    figsize = (20, 20),
+    col_linkage = col_linkage,
+    row_linkage = row_linkage,
+    colors_ratio = 0.01, # for thinner strip
+    dendrogram_ratio = (0.08, 0.08),
+    )
+
+
+    # shift colobar of cluster map up by 0.05
+    pos = g.cax.get_position()
+    g.cax.set_position([pos.x0 - 0.01, pos.y0 + 0.05, pos.width - 0.02, pos.height])  
+    g.cax.set_ylabel("z_score")
+    
+    # column tick labels (x-axis of the heatmap)
+    plt.setp(g.ax_heatmap.get_xticklabels(), fontsize=6, rotation=90)
+    g.ax_heatmap.set_xlabel("")
+    
+    # title
+    g.fig.suptitle(title, y=1.02, fontsize = 14)
+
+    # plot column annotation colors for continuous values (e.g., cell type proportions)
+    if col_colors is not None and scales is not None:
+        # --- Manually add a colorbar for the B annotation strip ---
+        cmap_ann = mpl.colormaps[cmap_name]
+    
+        # vmin, vmax for cell type scaling    
+        match scale_method:
+            case "min_max":
+                vmin = 0
+                vmax = 1
+            case "z_score":
+                #vmin, vmax are the smallest/biggest from all annotation features
+                vmin, vmax = get_zmin_zmax(scales)
+    
+        norm = mpl.colors.Normalize(vmin=vmin, vmax=vmax)
+        sm = mpl.cm.ScalarMappable(norm=norm, cmap=cmap_ann)
+        sm.set_array([])
+        
+        # # Add a small axis at the top of the figure (tweak numbers if placement isn’t ideal)
+        cax = g.fig.add_axes([0.72, 0.99, 0.25, 0.02])  # [left, bottom, width, height] in figure coords
+        cb = g.fig.colorbar(sm, cax=cax, orientation="horizontal")
+        # cb.set_label(f"Min-Max Cell type proportion")
+        cb.set_label(f"z score covariates")
+        # cb.set_ticks([np.round(vmin, 2), np.round((vmin + vmax) / 2,2), np.round(vmax,2)])
+        cb.set_ticks([vmin, (vmin + vmax) / 2, vmax])
+        cb.ax.tick_params(labelsize=12)
+
+    # Categorical legends (NEW)
+    if categorical_maps is not None and len(categorical_maps) > 0:
+        add_categorical_legends(g.fig, categorical_maps, anchor=(1.02, 0.98), fontsize=10)
+
+    return g
+    

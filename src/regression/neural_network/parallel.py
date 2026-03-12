@@ -152,6 +152,7 @@ def run_one_fold(data: DataInputs, hyperparams: ModelHyperparams, setup: TrainSe
     lr = setup.lr
     weight_decay = setup.weight_decay
     return_compositions = setup.return_compositions
+    use_lr_scheduler = setup.use_lr_scheduler
 
     # Build datasets for this fold
     datasets, extras = build_datasets_from_indices(
@@ -213,7 +214,7 @@ def run_one_fold(data: DataInputs, hyperparams: ModelHyperparams, setup: TrainSe
                       lr=lr, weight_decay=weight_decay,
                       epochs=epochs, recenter_y=(method == "ilr_recenter"),
                       device=device, dtype=torch.float32, verbose=False,
-                      use_lr_scheduler=True,
+                      use_lr_scheduler=use_lr_scheduler,
                       scheduler_name='cosine',
                       loss_fn = loss_fn,
                       )
@@ -242,7 +243,7 @@ def run_one_fold(data: DataInputs, hyperparams: ModelHyperparams, setup: TrainSe
             "train_mse_history": list(trainer.train_mse_history),
             "val_mse_history": list(trainer.val_mse_history),
             "test_mse": test_mse,
-            "cor_list": cor_list,
+            "cor_list": cor_list, #for cell type
             "rsq_list": rsq_list,
             "test_res": test_res,
             "trainer": trainer
@@ -376,4 +377,177 @@ def run_one_fold_celltype(data: DataInputs, hyperparams: ModelHyperparams, setup
             "test_res": test_res,
             "trainer": trainer
             # "model": trainer.model.cell_predictor.network
+            }
+
+
+# for 1 layer MLP initialized with pseudobulk linear regression
+
+def init_from_W_regression(model, W_regression, n_covariates, gene_mask, b_regression=None, device="cuda", dtype=torch.float32):
+    """
+    model: CompositionModel with model.cell_predictor.network[0] as nn.Linear(17465->16)
+    W_regression: (16, n_genes_total) numpy or torch
+    gene_mask: boolean mask (len n_genes_total) or integer indices selecting 17465 genes
+    b_regression: optional (16,) bias
+    """
+    linear = model.cell_predictor.network[0]
+    assert isinstance(linear, torch.nn.Linear)
+
+    # the last n_covariates columns are for covariates
+    W_genes = torch.as_tensor(W_regression[:, :-n_covariates], dtype=dtype)
+    W_genes = W_genes[:, gene_mask]  
+    # combine with covariates column
+    W = torch.hstack((W_genes, torch.as_tensor(W_regression[:, -n_covariates:], dtype = dtype)))
+
+    if W.shape != linear.weight.shape:
+        raise ValueError(f"Shape mismatch: sliced W {tuple(W.shape)} vs layer {tuple(linear.weight.shape)}")
+
+    with torch.no_grad():
+        linear.weight.copy_(W.to(device=device))
+        if linear.bias is not None:
+            if b_regression is None:
+                linear.bias.zero_()
+            else:
+                b = torch.as_tensor(b_regression, dtype=dtype)
+                linear.bias.copy_(b.to(device=device))
+                
+from typing import Callable, Union, Any, Dict
+
+def run_one_fold_init_regression(data: DataInputs, 
+                                 hyperparams: ModelHyperparams, 
+                                 setup: TrainSetup, 
+                                 fold: int, 
+                                 fold_idxs: Dict[str, Any],
+                                 W_regression: np.ndarray,
+                                 n_covariates: int) -> Dict[str, Any]:
+    '''
+    DataInputs: a DataClass storing data for training
+    hyperparams: a DataClass storing MLP architecture parameters
+    setup: a DataClass storing parameters to run the MLP
+    fold: the fold ordering (e.g., 0, 1, 2)
+    fold_idxs: storing indices of samples for training, validating and testing
+    '''
+    
+    # Unpack for clarity 
+    Xs_raw = data.Xs_raw
+    Z = data.Z
+    Y_imp_ilr = data.Y_imp_ilr
+    cell_type_proportions_df = data.cell_type_proportions_df
+    
+    hidden_features = hyperparams.hidden_features
+    num_hidden_layers = hyperparams.num_hidden_layers
+    activation = hyperparams.activation
+    dropout = hyperparams.dropout
+    batch_norm = hyperparams.batch_norm
+    bias = hyperparams.bias
+    scaling_factor = hyperparams.scaling_factor
+    method = hyperparams.method
+    layer_norm=hyperparams.layer_norm
+    activation_type=hyperparams.activation_type #still factory
+    loss_fn=hyperparams.loss_fn(**hyperparams.loss_fn_kwargs) #instantiate the factory here
+
+    
+    batch_size = setup.batch_size
+    device = setup.device
+    epochs = setup.epochs
+    lr = setup.lr
+    weight_decay = setup.weight_decay
+    return_compositions = setup.return_compositions
+    use_lr_scheduler = setup.use_lr_scheduler
+
+    # Build datasets for this fold
+    datasets, extras = build_datasets_from_indices(
+        method=method,
+        Xs_raw=Xs_raw,
+        Z=Z,
+        Y_imp_ilr=Y_imp_ilr,
+        cell_type_proportions_df=cell_type_proportions_df,
+        indices=fold_idxs,
+        dtype=torch.float32,
+    )
+    # Build loaders (use your compact collate)
+    loaders = build_loaders(datasets, batch_size=batch_size, num_workers=0, pin_memory=True, collate_fn=collate_samples_compact)
+    loader = loaders["train"]
+    loader_val = loaders["val"]
+    loader_test = loaders["test"]
+    
+    # Recompute training-only stats per fold
+    gene_mean, gene_std = compute_cellwise_stats(loader, device="cpu")
+    tol = 1e-6
+    gene_mask = (gene_std > tol)
+    G_kept = int(gene_mask.sum().item())
+    C = np.asarray(Z).shape[1]
+    in_features = G_kept + C
+    out_features = (Y_imp_ilr.shape[1] if method.endswith("ilr") else np.asarray(cell_type_proportions_df).shape[1])
+    age_column_id = Z.columns.tolist().index('ages')
+    train_idx = fold_idxs['train']
+    age_mean = Z.iloc[train_idx]['ages'].mean()
+    age_std = Z.iloc[train_idx]['ages'].std()
+    
+    # Build preprocessor and model for this fold
+    pre = Preprocessor(gene_mask=gene_mask.to(device=device),
+                       gene_mean=gene_mean.to(device=device),
+                       gene_std=gene_std.to(device=device),
+                       cont_cov_mask=age_column_id,
+                       cov_mean=torch.tensor(age_mean).to(device=device),
+                       cov_std=torch.tensor(age_std).to(device=device),
+                       scaling_factor=scaling_factor,
+                       normalize=True)
+   
+    model = CompositionModel(
+        in_features=in_features,
+        out_features=out_features,
+        method=method,
+        aggregator_mode="mean",
+        preprocessor=pre,
+        hidden_features=hidden_features, 
+        num_hidden_layers=num_hidden_layers, 
+        activation=activation,
+        dropout=dropout, 
+        batch_norm=batch_norm, 
+        bias=bias, 
+        dtype=torch.float32,
+        layer_norm=layer_norm,
+        activation_type=activation_type,
+    )
+    #initialize with pseudobulk weights
+    init_from_W_regression(model, W_regression, n_covariates, gene_mask, b_regression=None)
+
+    # Train on this device
+    trainer = Trainer(model, loader, loader_val,
+                      lr=lr, weight_decay=weight_decay,
+                      epochs=epochs, recenter_y=(method == "ilr_recenter"),
+                      device=device, dtype=torch.float32, verbose=False,
+                      use_lr_scheduler=use_lr_scheduler,
+                      scheduler_name='cosine',
+                      loss_fn = loss_fn,
+                      )
+    trainer.fit()
+    # Evaluate on test
+    from torch.nn.functional import mse_loss
+    test_res = evaluate_on_loader(trainer.model, loader_test, device=trainer.device,
+                                  recenter_y=trainer.recenter_y, y_mean=trainer.y_mean,
+                                  return_compositions=return_compositions, method=method)
+    test_mse = mse_loss(test_res["preds"], test_res["targets"], reduction="mean").item()
+    
+    # include checking on cell type
+    cor_list = []
+    rsq_list = []
+    if test_res.get("preds_comp") != None and test_res.get("targets_comp") != None:
+        preds_ct = test_res["preds_comp"].cpu().numpy()
+        targets_ct = test_res["targets_comp"].cpu().numpy()
+        cor_list = [np.corrcoef(preds_ct[:, i], targets_ct[:, i], rowvar=False)[0][1] for i in range(preds_ct.shape[1])]
+        def rsquared_feature(Y_pred, Y_obs):
+            SSE = np.sum((Y_pred - Y_obs)**2, axis = 0)
+            SST = np.sum((Y_obs - np.mean(Y_obs, axis = 0))**2, axis = 0)
+            return 1 - SSE / SST
+        rsq_list = [rsquared_feature(preds_ct[:, i], targets_ct[:, i]) for i in range(preds_ct.shape[1])]
+
+    return {"fold": fold,
+            "train_mse_history": list(trainer.train_mse_history),
+            "val_mse_history": list(trainer.val_mse_history),
+            "test_mse": test_mse,
+            "cor_list": cor_list, #for cell type
+            "rsq_list": rsq_list,
+            "test_res": test_res,
+            "trainer": trainer
             }

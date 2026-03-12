@@ -37,3 +37,4 @@ class TrainSetup:
     lr: float
     weight_decay: float
     return_compositions: bool = True  
+    use_lr_scheduler: bool = False  

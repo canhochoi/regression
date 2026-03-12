@@ -11,7 +11,7 @@ from skbio.stats.composition import clr
 
 
 
-__all__ = ["RidgeRRR", "RidgeRRRCV", "RRRBinEvaluator"]
+__all__ = ["RidgeRRR", "RidgeRRRCV", "RRRBinEvaluator", "RidgeBinEvaluator"]
 
 class RidgeRRR(UtilityMixin):
     """
@@ -460,5 +460,159 @@ class RRRBinEvaluator:
             if verbose == True:
                 print(f"Bin {fold_test}: rank={cv.best_rank_}, lambda={cv.best_lambda_:.5g}, "
                     f"MSE clr comp={mse_clr_comp:.4f}")
+
+        return metrics_by_bin
+
+
+
+# a class for ridge regression without reduced-rank projection, for comparison
+import numpy as np
+from skbio.stats.composition import clr
+
+from .preprocessing import StandardScalerX, CenterY
+from .checkfitting import CheckFitting
+
+
+class RidgeBinEvaluator:
+    """
+    Evaluate multi-output Ridge regression across TrainTestSplit bins (folds),
+    analogous to RRRBinEvaluator but without reduced-rank projection.
+
+    Uses RidgeCV on each training split to select alpha (lambda), then predicts on held-out.
+    """
+
+    def __init__(self, alpha_grid=None, n_splits_cv=5):
+        self.alpha_grid = alpha_grid
+        self.n_splits_cv = int(n_splits_cv)
+
+    def evaluate(
+        self,
+        X_design,
+        Y_ilr,
+        train_test,
+        ilr_tx,
+        cell_type_proportions_df,
+        sample_weight=None,
+        verbose=True
+    ):
+        """
+        Parameters
+        ----------
+        X_design : ndarray (n x p)
+            Predictor matrix.
+        Y_ilr : ndarray (n x q_ilr)
+            ILR-transformed responses.
+        train_test : TrainTestSplit
+            Must provide split(X, Y, fold=...), filter_feature(X_train, X_test),
+            and a .bins vector to identify held-out indices.
+        ilr_tx : CompositionalILR
+            Must support inverse_transform(Y_ilr).
+        cell_type_proportions_df : pd.DataFrame (n x q)
+            Provides sample index and part names.
+        sample_weight : array-like length n or None
+            Optional sample weights (e.g., number of cells).
+            NOTE: sklearn RidgeCV does not support sample_weight for CV scoring
+            in all versions; we pass it to the final fit if possible.
+        """
+
+        from sklearn.linear_model import RidgeCV, Ridge
+        from sklearn.model_selection import KFold
+
+        metrics_by_bin = {}
+
+        # Default alpha grid
+        if self.alpha_grid is None:
+            self.alpha_grid = (10.0 ** np.linspace(-6, 4, 40)).tolist()
+
+        for fold_test in range(1, train_test.nfolds + 1):
+            # Split into train/test for this fold
+            X_train, X_test, Y_train, Y_test = train_test.split(X_design, Y_ilr, fold=fold_test)
+
+            # Drop non-finite / zero-variance columns
+            X_train, X_test = train_test.filter_feature(X_train, X_test)
+
+            # Standardize X on training; center Y_ilr on training
+            x_scaler = StandardScalerX()
+            X_train_s = x_scaler.fit_transform(X_train)
+            X_test_s = (X_test - x_scaler.mean_) / x_scaler.std_
+
+            y_center = CenterY()
+            Y_train_c = y_center.fit_transform(Y_train)
+
+            # Align weights to this split if provided
+            if sample_weight is not None:
+                test_mask = (train_test.bins == fold_test)
+                train_mask = ~test_mask
+                w_train = np.asarray(sample_weight)[train_mask]
+                w_test = np.asarray(sample_weight)[test_mask]
+            else:
+                w_train = None
+                w_test = None
+
+            # -----------------------
+            # # Inner CV to choose alpha
+            # -----------------------
+            # RidgeCV support for sample_weight varies; safest is to ignore weights in CV selection
+            # and optionally refit a Ridge(alpha=best_alpha) with sample weights.
+            ridge_cv = RidgeCV(alphas=self.alpha_grid, cv=self.n_splits_cv)
+            ridge_cv.fit(X_train_s, Y_train_c)
+            best_alpha = float(ridge_cv.alpha_)
+
+            # Optional refit with weights (if you want weights in the final fit)
+            if w_train is not None:
+                ridge = Ridge(alpha=best_alpha)
+                ridge.fit(X_train_s, Y_train_c, sample_weight=w_train)
+                Y_test_c_hat = ridge.predict(X_test_s)
+                model = ridge
+            else:
+                Y_test_c_hat = ridge_cv.predict(X_test_s)
+                model = ridge_cv
+
+            # Undo centering (ilr-space)
+            Y_test_ilr_hat = Y_test_c_hat + y_center.mean_
+
+            # Invert ILR back to compositions
+            Y_test_comp_hat = ilr_tx.inverse_transform(Y_test_ilr_hat)
+            Y_true_obs_comp = ilr_tx.inverse_transform(Y_test)
+
+            # Build index of held-out samples
+            test_mask = (train_test.bins == fold_test)
+            test_index = cell_type_proportions_df.index[test_mask]
+
+            # Metrics in composition space
+            checkfitting = CheckFitting(test_index=test_index, col_names=cell_type_proportions_df.columns)
+
+            cors_comp = checkfitting.corr(Y_pred=Y_test_comp_hat, Y_obs=Y_true_obs_comp)
+            Rsq_comp = checkfitting.rsquared_feature(Y_pred=Y_test_comp_hat, Y_obs=Y_true_obs_comp)
+            mse_comp = checkfitting.mse(Y_pred=Y_test_comp_hat, Y_obs=Y_true_obs_comp, sample_weight=w_test)
+
+            # Metrics in CLR space
+            Y_pred_clr = clr(Y_test_comp_hat)
+            Y_obs_clr = clr(Y_true_obs_comp)
+            cors_clr_comp = checkfitting.corr(Y_pred=Y_pred_clr, Y_obs=Y_obs_clr)
+            Rsq_clr_comp = checkfitting.rsquared_feature(Y_pred=Y_pred_clr, Y_obs=Y_obs_clr)
+            mse_clr_comp = checkfitting.mse(Y_pred=Y_pred_clr, Y_obs=Y_obs_clr, sample_weight=w_test)
+
+            metrics_by_bin[fold_test] = {
+                "model": model,
+                "keep_mask": train_test.keep_mask,
+                "selected_alpha": best_alpha,
+                "mse_comp": mse_comp,
+                "cors_comp": cors_comp,
+                "Rsq_comp": Rsq_comp,
+                "mse_clr_comp": mse_clr_comp,
+                "cors_clr_comp": cors_clr_comp,
+                "Rsq_clr_comp": Rsq_clr_comp,
+                "Y_test_comp_df": checkfitting.convert_df(Y_test_comp_hat),
+                "Y_obs_comp_df": checkfitting.convert_df(Y_true_obs_comp),
+                "X_train_s": X_train_s,
+                "X_test_s": X_test_s,
+            }
+
+            if verbose:
+                print(
+                    f"Bin {fold_test}: alpha={best_alpha:.5g}, "
+                    f"MSE clr comp={mse_clr_comp:.4f}"
+                )
 
         return metrics_by_bin

@@ -577,6 +577,9 @@ class Trainer:
                  epochs: int = 500,
                  log_interval: int = 50,
                  recenter_y: bool = False,
+                 rescale_y: bool = False,
+                 y_mean: Optional[torch.Tensor] = None,
+                 y_std: Optional[torch.Tensor] = None,
                  device: Optional[torch.device] = "cuda",
                  dtype: Optional[torch.dtype] = torch.float32,
                  verbose: bool = False,
@@ -597,7 +600,9 @@ class Trainer:
         self.epochs = epochs
         self.log_interval = log_interval
         self.recenter_y = recenter_y
-        self.y_mean = None
+        self.rescale_y = rescale_y
+        self.y_mean = y_mean
+        self.y_std = y_std
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.dtype = dtype
         self.verbose = verbose
@@ -666,6 +671,21 @@ class Trainer:
             n += Yb.shape[0]
         self.y_mean = s / max(n, 1)
 
+    def _compute_y_std(self):
+        # compute std of Y over training set
+        if self.y_mean is None:
+            self._compute_y_mean()
+        s = None
+        n = 0
+        for _, _, _, Yb, _ in self.train_loader:
+            Yb = Yb.to(self.device, dtype=self.dtype)
+            diff = Yb - self.y_mean
+            sq_diff = diff ** 2
+            s = sq_diff.sum(dim=0) if s is None else s + sq_diff.sum(dim=0)
+            n += Yb.shape[0]
+        y_var = s / max(n - 1, 1)
+        self.y_std = torch.sqrt(y_var)
+
     def train_epoch(self):
         self.model.train()
         total_sum = 0.0
@@ -673,8 +693,11 @@ class Trainer:
         for Xb, cell_to_batch, Zb, Yb, sample_idx_batch in self.train_loader:
             self.optimizer.zero_grad(set_to_none=True)
             Yb = Yb.to(self.device, dtype=self.dtype)
-            if self.recenter_y and (self.y_mean is not None): 
+            if self.recenter_y: 
                 Yb = Yb - self.y_mean
+            if self.rescale_y:
+                Yb = Yb / self.y_std
+
             Xb = Xb.to(self.device, dtype=self.dtype)
             Zb = Zb.to(self.device, dtype=self.dtype)
             cell_to_batch = cell_to_batch.to(self.device)
@@ -687,8 +710,12 @@ class Trainer:
                 loss = self.loss_fn(preds.float(), Yb.float())
             loss.backward()
             self.optimizer.step()
-            total_sum += nn.MSELoss(reduction="sum")(preds.float(), Yb.float()).item()
-            total_elems += Yb.numel()
+            # total_sum += nn.MSELoss(reduction="sum")(preds.float(), Yb.float()).item()
+            # total_elems += Yb.numel()
+            # average over samples (and maybe over cell types) by multiplying by batch size
+            total_sum += loss.detach().item() * Yb.shape[0]
+            total_elems += Yb.shape[0]
+
         epoch_mse = total_sum / total_elems
         self.train_mse_history.append(epoch_mse)
         return epoch_mse
@@ -700,15 +727,26 @@ class Trainer:
         with torch.no_grad():
             for Xb, cell_to_batch, Zb, Yb, sample_idx_batch in self.val_loader:
                 Yb = Yb.to(self.device, dtype=torch.float32)
-                if self.recenter_y and (self.y_mean is not None): 
+                if self.recenter_y: 
                     Yb = Yb - self.y_mean
+                if self.rescale_y:
+                    Yb = Yb / self.y_std
+
                 Xb = Xb.to(self.device, dtype=self.dtype)
                 Zb = Zb.to(self.device, dtype=self.dtype)
                 cell_to_batch = cell_to_batch.to(self.device)
                 sample_idx_batch = sample_idx_batch.to(self.device)
                 preds = self.model(Xb, Zb, cell_to_batch, sample_idx_batch)
-                total_sum += nn.MSELoss(reduction="sum")(preds.float(), Yb.float()).item()
-                total_elems += Yb.numel()
+                # total_sum += nn.MSELoss(reduction="sum")(preds.float(), Yb.float()).item()
+                # total_elems += Yb.numel()
+                # average over samples (and maybe over cell types) by multiplying by batch size
+                if isinstance(self.loss_fn, nn.KLDivLoss):
+                    preds_log = torch.log(preds + 1e-8) 
+                    total_sum += self.loss_fn(preds_log.float(), Yb.float()).item() * Yb.shape[0]
+                else:
+                    total_sum += self.loss_fn(preds.float(), Yb.float()).item() * Yb.shape[0]
+                total_elems += Yb.shape[0]
+
         epoch_mse = total_sum / total_elems
         self.val_mse_history.append(epoch_mse)
         return epoch_mse
@@ -739,7 +777,10 @@ class Trainer:
 
     def fit(self):
         if self.recenter_y: 
-            self._compute_y_mean()
+            assert self.y_mean is not None, "y_mean must be provided or computed before training when recenter_y is True"
+        if self.rescale_y:
+            assert self.y_std is not None, "y_std must be provided or computed before training when rescale_y is True"
+
         for ep in tqdm(range(self.epochs)):
             tr = self.train_epoch()
             va = self.validate()

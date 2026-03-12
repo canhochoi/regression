@@ -205,11 +205,12 @@ def build_datasets(
     
     Xs_raw: list of S sample cell-gene matrices
     Z: sample-level covariates (S, C)
-    Y_imp_ilr: ILR-transformed targets (S, T) or None
+    Y_imp: ILR-transformed targets (S, T) or CLR-transformed or None
     cell_type_proportions_df: cell-type proportions dataframe (S, T) 
 
     method:
-      - endswith('ilr'): targets are ILR (Y_imp_ilr).
+      - endswith('ilr'): targets are ILR (Y_imp).
+      - endswith('clr'): targets are CLR (Y_imp).
       - else: targets are cell-type compositions (cell_type_proportions_df).
       - special 'ilr_recenter': subtract training mean from ILR and use centered targets.
 
@@ -253,9 +254,11 @@ def build_datasets(
                 Y_ilr_np[idx, :],
                 dtype=dtype,
             )
-        # Optionally also compute training mean if you plan to recenter in loss
+        # Optionally also compute training mean and std if you plan to recenter in loss
         extras["Y_train_mean"] = Y_ilr_np[idxs["train"], :].mean(axis=0)
-    else:
+        extras["Y_train_std"] = Y_ilr_np[idxs["train"], :].std(axis=0)
+
+    elif method.endswith("celltype"):
         # Cell-type proportions
         assert cell_type_proportions_df is not None, "cell_type_proportions_df must be provided for composition methods."
         Y_comp_np = np.asarray(cell_type_proportions_df, dtype=np.float32)
@@ -265,6 +268,18 @@ def build_datasets(
                 [Xs_raw[i] for i in idx.tolist()],
                 Z_np[idx, :],
                 Y_comp_np[idx, :],
+                dtype=dtype,
+            )
+    elif method.endswith("clr"):
+        # Cell-type proportions with CLR targets
+        assert Y_imp_ilr is not None, "Y_imp_ilrmust be provided for composition methods."
+        Y_clr_np = np.asarray(Y_imp_ilr, dtype=np.float32)
+        for split in ("train", "val", "test"):
+            idx = idxs[split]
+            datasets[split] = SampleCellsDataset(
+                [Xs_raw[i] for i in idx.tolist()],
+                Z_np[idx, :],
+                Y_clr_np[idx, :],
                 dtype=dtype,
             )
 
